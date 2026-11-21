@@ -56,6 +56,9 @@ h1,h2,p,dl,dd{margin:0}
 .fact a{color:var(--accent)}
 .section-title{font-weight:600;font-size:16px;margin:22px 0 5px}
 .statement{white-space:pre-wrap;overflow-wrap:anywhere;max-width:68ch}
+.fact dd span{display:block}
+.from{margin-top:14px;font-size:15px;font-weight:600;color:var(--muted)}
+.from + .statement{margin-top:2px}
 
 .dock{grid-area:dock;background:var(--surface);border-top:1px solid var(--line);padding:10px 16px calc(10px + env(safe-area-inset-bottom));touch-action:manipulation}
 .rate{display:grid;grid-template-columns:minmax(0,1fr) 104px;gap:12px;align-items:center;max-width:760px;margin:0 auto}
@@ -187,11 +190,11 @@ h1,h2,p,dl,dd{margin:0}
       else if (key.slice(0, 2) === 'on') node.addEventListener(key.slice(2), val);
       else node.setAttribute(key, val);
     });
-    for (var a = 2; a < arguments.length; a++) {
-      var kid = arguments[a];
-      if (kid === null || kid === undefined || kid === false) continue;
-      (Array.isArray(kid) ? kid : [kid]).forEach(function (k) { if (k) node.appendChild(k); });
-    }
+    var add = function (kid) {
+      if (Array.isArray(kid)) kid.forEach(add);
+      else if (kid) node.appendChild(kid);
+    };
+    for (var a = 2; a < arguments.length; a++) add(arguments[a]);
     return node;
   }
 
@@ -438,8 +441,22 @@ h1,h2,p,dl,dd{margin:0}
     var mini = [['Current role', n.occupation], ['Course', n.course], ['Batch', n.batch]]
       .filter(function (f) { return f[1]; })
       .map(function (f) { return el('div', {}, el('dt', { text: f[0] }), el('dd', { text: f[1] })); });
-    var nominator = n.type === 'Self' ? 'Self-nominated' : [n.nominatedBy, n.relationship].filter(Boolean).join(', ');
-    var facts = nominator ? [el('div', { cls: 'fact' }, el('dt', { text: 'Nominated by' }), el('dd', { text: nominator }))] : [];
+    var noms = n.nominations && n.nominations.length ? n.nominations : [{
+      by: n.type === 'Self' ? 'Self-nominated' : [n.nominatedBy, n.relationship].filter(Boolean).join(', '),
+      self: n.type === 'Self', contribution: n.contribution
+    }];
+    var facts = [el('div', { cls: 'fact' },
+      el('dt', { text: noms.length > 1 ? 'Nominated by (' + noms.length + ')' : 'Nominated by' }),
+      el('dd', {}, noms.map(function (x) { return el('span', { text: x.by }); })))];
+    var written = noms.filter(function (x) { return x.contribution; });
+    var statements = !written.length
+      ? [el('p', { cls: 'statement', text: 'Nothing was entered in the form.' })]
+      : noms.length === 1
+        ? [el('p', { cls: 'statement', text: written[0].contribution })]
+        : written.map(function (x) {
+          return [el('p', { cls: 'from', text: x.self ? 'From the nominee' : 'From ' + x.by }),
+            el('p', { cls: 'statement', text: x.contribution })];
+        });
     if (n.linkedin) {
       facts.push(el('div', { cls: 'fact' }, el('dt', { text: 'LinkedIn' }),
         el('dd', {}, el('a', { href: n.linkedin, target: '_blank', rel: 'noopener', text: 'Open profile' }))));
@@ -453,7 +470,7 @@ h1,h2,p,dl,dd{margin:0}
         el('dl', { cls: 'mini' }, mini)),
       el('dl', { cls: 'facts' }, facts),
       el('h2', { cls: 'section-title', text: 'How they can contribute to VESP' }),
-      el('p', { cls: 'statement', text: n.contribution || 'Nothing was entered in the form.' })
+      statements
     ];
 
     var stars = el('div', {
