@@ -104,6 +104,7 @@ h1,h2,p,dl,dd{margin:0}
 .row-score.none{font:500 14px/1.2 var(--body);color:var(--muted)}
 .callout{margin-top:12px;padding:12px 14px;border-radius:8px;background:var(--accent-soft);border:1px solid #BFD0E3;color:var(--accent);font-weight:600;line-height:1.4}
 .callout span{display:block}
+[hidden]{display:none!important}
 .notice{margin-top:14px;padding:10px 12px;border-radius:6px;background:var(--warn-soft);color:var(--warn);font-size:15px}
 
 .side .row{padding:9px 16px}
@@ -152,19 +153,39 @@ h1,h2,p,dl,dd{margin:0}
 (function () {
   'use strict';
   /* For a hosted copy, replace the text below with the web app link ending in /exec. */
-  var API_URL = 'https://script.google.com/macros/s/AKfycbwU--wjC_29miM0FzcEEvqSYoSevD8b1PKGXg-X5jqsb6i3qTJoOnOdSrRLy0QWN6PlUQ/exec';
+  var API_URL = 'PASTE_WEB_APP_LINK_HERE';
   var inAppsScript = !!(window.google && google.script && google.script.run);
   var CODE = inAppsScript ? (document.body.dataset.code || '') : (new URLSearchParams(location.search).get('k') || '');
   var app = document.getElementById('app');
   var S = { d: null, view: 'loading', i: 0, v: {}, photos: {}, q: {}, busy: false, failed: false, timer: null, retry: null };
 
+  /* A request that gets no answer in this time is treated as failed and tried again, so the page never waits forever. */
+  var CALL_TIMEOUT = 30000;
+
   function call(name) {
     var args = Array.prototype.slice.call(arguments, 1);
+    var timer;
+    var timeout = new Promise(function (resolve, reject) {
+      timer = setTimeout(function () { reject(new Error('timeout')); }, CALL_TIMEOUT);
+    });
+    return Promise.race([send(name, args), timeout]).then(function (value) {
+      clearTimeout(timer);
+      return value;
+    }, function (err) {
+      clearTimeout(timer);
+      throw err;
+    });
+  }
+
+  function send(name, args) {
     if (!inAppsScript) {
+      var ctrl = window.AbortController ? new AbortController() : null;
+      if (ctrl) setTimeout(function () { ctrl.abort(); }, CALL_TIMEOUT);
       return fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({ action: name, args: args })
+        body: JSON.stringify({ action: name, args: args }),
+        signal: ctrl ? ctrl.signal : undefined
       }).then(function (res) {
         if (!res.ok) throw new Error('Request failed');
         return res.json();
@@ -585,6 +606,8 @@ h1,h2,p,dl,dd{margin:0}
         el('span', { text: 'Tap any name to change a rating.' }),
         el('span', { text: 'You cannot change ratings after submitting.' })),
       crowded ? el('p', { cls: 'notice', text: counts[crowded] + ' nominees share a score of ' + fmt(crowded) + '. Separate them if you can, because awards are limited.' }) : null,
+      el('p', { cls: 'notice', id: 'submit-note', hidden: 'hidden',
+        text: 'Your ratings did not reach us. Check your internet connection and tap Submit my ratings again. Ratings already saved are kept.' }),
       el('div', { cls: 'rows' }, items.map(function (x) { return nomineeRow(x.n, x.i, openNominee); }))
     ];
     var dock = el('footer', { cls: 'dock' }, el('button', {
@@ -601,9 +624,16 @@ h1,h2,p,dl,dd{margin:0}
   function submit() {
     var button = document.getElementById('submit');
     if (button) { button.disabled = true; button.textContent = 'Submitting'; }
-    drain().then(function () { return call('submitBallot', CODE); }).then(load).catch(function () {
+    var note = document.getElementById('submit-note');
+    if (note) note.hidden = true;
+    drain().then(function () { return call('submitBallot', CODE); }).then(function (res) {
+      if (res && res.ok === false && res.reason === 'incomplete') { load('review'); return; }
+      load();
+    }).catch(function () {
       if (button) { button.disabled = false; button.textContent = 'Submit my ratings'; }
       paintSave('failed');
+      var notice = document.getElementById('submit-note');
+      if (notice) notice.hidden = false;
     });
   }
 
@@ -614,7 +644,7 @@ h1,h2,p,dl,dd{margin:0}
       retry ? el('button', { cls: 'btn primary', type: 'button', text: 'Try again', onclick: load }) : null)));
   }
 
-  function load() {
+  function load(next) {
     message('Loading nominees', 'This can take a few seconds.');
     call('getBallot', CODE).then(function (d) {
       S.d = d;
@@ -625,11 +655,16 @@ h1,h2,p,dl,dd{margin:0}
       if (!d.nominees.length) return message('No nominees yet', 'Please check back once the list is ready.');
       S.v = d.votes || {};
       S.q = {};
-      home();
+      if (next === 'review') review(); else home();
     }).catch(function () {
       message('The nominees did not load', 'Check your connection and try again.', true);
     });
   }
+
+  /* Phones pause pages in the background; send anything still waiting when the voter comes back. */
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible' && S.d && Object.keys(S.q).length && !S.busy) pump();
+  });
 
   load();
 })();
