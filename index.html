@@ -153,7 +153,7 @@ h1,h2,p,dl,dd{margin:0}
 (function () {
   'use strict';
   /* For a hosted copy, replace the text below with the web app link ending in /exec. */
-  var API_URL = 'PASTE_WEB_APP_LINK_HERE';
+  var API_URL = 'https://script.google.com/macros/s/AKfycbwU--wjC_29miM0FzcEEvqSYoSevD8b1PKGXg-X5jqsb6i3qTJoOnOdSrRLy0QWN6PlUQ/exec';
   var inAppsScript = !!(window.google && google.script && google.script.run);
   var CODE = inAppsScript ? (document.body.dataset.code || '') : (new URLSearchParams(location.search).get('k') || '');
   var app = document.getElementById('app');
