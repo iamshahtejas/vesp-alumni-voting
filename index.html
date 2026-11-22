@@ -105,6 +105,7 @@ h1,h2,p,dl,dd{margin:0}
 .callout{margin-top:12px;padding:12px 14px;border-radius:8px;background:var(--accent-soft);border:1px solid #BFD0E3;color:var(--accent);font-weight:600;line-height:1.4}
 .callout span{display:block}
 [hidden]{display:none!important}
+.notice .code{margin-top:6px;font-size:13px;opacity:.8}
 .notice{margin-top:14px;padding:10px 12px;border-radius:6px;background:var(--warn-soft);color:var(--warn);font-size:15px}
 
 .side .row{padding:9px 16px}
@@ -157,18 +158,23 @@ h1,h2,p,dl,dd{margin:0}
   var inAppsScript = !!(window.google && google.script && google.script.run);
   var CODE = inAppsScript ? (document.body.dataset.code || '') : (new URLSearchParams(location.search).get('k') || '');
   var app = document.getElementById('app');
-  var S = { d: null, view: 'loading', i: 0, v: {}, photos: {}, q: {}, busy: false, failed: false, timer: null, retry: null };
+  var S = { d: null, view: 'loading', i: 0, v: {}, photos: {}, q: {}, busy: false, failed: false, timer: null, retry: null,
+    single: false, lastError: '', submitting: false };
 
-  /* A request that gets no answer in this time is treated as failed and tried again, so the page never waits forever. */
-  var CALL_TIMEOUT = 30000;
+  /* Google's script server sometimes takes a minute to answer a request it would normally answer in
+     2 seconds. So every request has a short time limit and is simply sent again; all requests are safe to repeat. */
+  var CALL_TIMEOUT = 15000;
 
-  function call(name) {
-    var args = Array.prototype.slice.call(arguments, 1);
+  function call(name, args, limit) {
     var timer;
+    var ctrl = window.AbortController ? new AbortController() : null;
     var timeout = new Promise(function (resolve, reject) {
-      timer = setTimeout(function () { reject(new Error('timeout')); }, CALL_TIMEOUT);
+      timer = setTimeout(function () {
+        if (ctrl) ctrl.abort();
+        reject(new Error('timeout'));
+      }, limit || CALL_TIMEOUT);
     });
-    return Promise.race([send(name, args), timeout]).then(function (value) {
+    return Promise.race([send(name, args, ctrl), timeout]).then(function (value) {
       clearTimeout(timer);
       return value;
     }, function (err) {
@@ -177,20 +183,33 @@ h1,h2,p,dl,dd{margin:0}
     });
   }
 
-  function send(name, args) {
+  /* Tries up to `tries` times. onRetry(attempt) lets the screen say it is still trying. */
+  function callRetry(name, args, tries, onRetry) {
+    var attempt = 1;
+    return new Promise(function (resolve, reject) {
+      (function go() {
+        call(name, args).then(resolve, function (err) {
+          if (attempt >= tries) return reject(err);
+          attempt++;
+          if (onRetry) onRetry(attempt);
+          setTimeout(go, 1500);
+        });
+      })();
+    });
+  }
+
+  function send(name, args, ctrl) {
     if (!inAppsScript) {
-      var ctrl = window.AbortController ? new AbortController() : null;
-      if (ctrl) setTimeout(function () { ctrl.abort(); }, CALL_TIMEOUT);
       return fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({ action: name, args: args }),
         signal: ctrl ? ctrl.signal : undefined
       }).then(function (res) {
-        if (!res.ok) throw new Error('Request failed');
+        if (!res.ok) throw new Error('http-' + res.status);
         return res.json();
       }).then(function (res) {
-        if (res.error) throw new Error(res.error);
+        if (res.error) { var err = new Error(res.error); err.server = true; throw err; }
         return res.data;
       });
     }
@@ -262,64 +281,69 @@ h1,h2,p,dl,dd{margin:0}
   }
   function subline(n) { return [n.course, n.batch].filter(Boolean).join(', batch of '); }
 
-  /* Saving: one request at a time, always the latest value for each nominee. */
+  /* Every rating is kept in this phone's browser first, so nothing is lost if the page closes or the
+     connection drops. Ratings are also copied to the server quietly in the background, but Submit does
+     not depend on that: it sends all ratings again in one request. */
+  var BACKUP = 'vesp-award-unsaved-' + CODE;
+  function backup() {
+    try {
+      if (Object.keys(S.q).length) localStorage.setItem(BACKUP, JSON.stringify(S.q));
+      else localStorage.removeItem(BACKUP);
+    } catch (e) { /* private browsing: nothing to keep */ }
+  }
+  function restore() {
+    try {
+      var saved = JSON.parse(localStorage.getItem(BACKUP) || '{}');
+      Object.keys(saved).forEach(function (id) {
+        if (!saved[id] || typeof saved[id] !== 'object') return;
+        S.v[id] = { score: saved[id].score || null, recused: !!saved[id].recused };
+        S.q[id] = S.v[id];
+      });
+    } catch (e) { /* ignore a damaged backup */ }
+  }
+
   function queueSave(id) {
     S.q[id] = S.v[id];
-    paintSave('saving');
+    backup();
+    paintSave('');
     clearTimeout(S.timer);
-    S.timer = setTimeout(pump, 350);
+    S.timer = setTimeout(pump, 1500);
   }
-  function drain() {
-    clearTimeout(S.timer);
-    pump();
-    return new Promise(function (resolve, reject) {
-      (function wait() {
-        if (!Object.keys(S.q).length && !S.busy) return resolve();
-        if (S.failed && !S.busy) return reject(new Error('unsaved'));
-        setTimeout(wait, 120);
-      })();
-    });
-  }
-  /* Everything waiting is sent together in one request. */
+  /* Background copy to the server: one request at a time, never shown as an error to the member. */
   function pump() {
-    if (S.busy) return;
+    if (S.busy || S.submitting) return;
+    clearTimeout(S.retry);
+    S.retry = null;
     var ids = Object.keys(S.q);
-    if (!ids.length) { S.failed = false; paintSave('saved'); return; }
+    if (!ids.length) { backup(); paintSave('saved'); return; }
     var sent = {};
     var list = ids.map(function (id) {
       sent[id] = S.q[id];
       return { id: id, score: S.q[id].score || null, recused: !!S.q[id].recused };
     });
     S.busy = true;
-    paintSave('saving');
-    call('saveVotes', CODE, list).then(function (res) {
+    var request = S.single ? call('saveVote', [CODE, list[0].id, list[0].score, list[0].recused])
+      : call('saveVotes', [CODE, list]);
+    if (S.single) { ids = ids.slice(0, 1); }
+    request.then(function (res) {
       S.busy = false;
-      ids.forEach(function (id) { if (S.q[id] === sent[id]) delete S.q[id]; });
-      if (res && res.ok === false) {
-        if (res.reason === 'nominee' || res.reason === 'score') { S.failed = true; paintSave('failed'); return; }
-        load();
+      if (res && res.ok === false && res.reason !== 'nominee' && res.reason !== 'score') {
+        if (!S.submitting) load(S.view === 'review' ? 'review' : null);
         return;
       }
-      S.failed = false;
+      ids.forEach(function (id) { if (S.q[id] === sent[id]) delete S.q[id]; });
+      backup();
       pump();
-    }).catch(function () {
+    }).catch(function (err) {
       S.busy = false;
-      S.failed = true;
-      paintSave('failed');
-      clearTimeout(S.retry);
-      S.retry = setTimeout(pump, 6000);
+      if (err && err.server && err.message !== 'timeout' && !S.single) { S.single = true; pump(); return; }
+      S.retry = setTimeout(pump, 20000);
     });
   }
   function paintSave(state) {
     var box = document.getElementById('save');
     if (!box) return;
-    box.textContent = '';
-    if (state === 'saving') box.textContent = 'Saving';
-    if (state === 'saved') box.textContent = 'Saved';
-    if (state === 'failed') {
-      box.appendChild(document.createTextNode('Not saved. '));
-      box.appendChild(el('button', { text: 'Try again', onclick: pump }));
-    }
+    box.textContent = state === 'saved' ? 'Saved' : '';
   }
 
   /* Rating */
@@ -531,36 +555,49 @@ h1,h2,p,dl,dd{margin:0}
     shell(kids, dock);
     paintRating();
     showPhoto(n);
-    if (nominees()[index + 1]) loadPhoto(nominees()[index + 1]);
+    var nextOne = nominees()[index + 1];
+    if (nextOne && !nextOne.photoUrl) loadPhoto(nextOne);
     var heading = document.getElementById('name');
     if (heading) heading.focus({ preventScroll: true });
     paintSave(Object.keys(S.q).length ? 'saving' : '');
   }
 
-  function loadPhoto(n) {
+  /* Photos come straight from Google Drive when the files can be viewed by link; otherwise from the
+     script, one at a time, so photo requests never crowd out ratings. */
+  function photoFromScript(n) {
     if (!n.hasPhoto) return Promise.resolve(null);
     if (S.photos[n.id] === undefined) {
-      S.photos[n.id] = call('getPhoto', CODE, n.id).catch(function () { delete S.photos[n.id]; return null; });
+      S.photos[n.id] = call('getPhoto', [CODE, n.id], 20000).catch(function () { delete S.photos[n.id]; return null; });
     }
     return S.photos[n.id];
   }
-  /* Load every photo in the background, three at a time, while the member reads the first screen. */
   function prefetchPhotos() {
-    var queue = nominees().filter(function (n) { return n.hasPhoto; });
-    var next = function () {
-      var n = queue.shift();
-      if (n) loadPhoto(n).then(next, next);
-    };
-    for (var k = 0; k < 3; k++) next();
-  }
-  function showPhoto(n) {
-    loadPhoto(n).then(function (src) {
-      if (!src || S.view !== 'nominee' || current().id !== n.id) return;
-      var slot = document.getElementById('photo');
-      if (!slot) return;
-      slot.replaceWith(el('img', { cls: 'photo', id: 'photo', src: src, alt: 'Photograph of ' + n.name }));
+    nominees().forEach(function (n) {
+      if (!n.photoUrl) return;
+      var img = new Image();
+      img.onerror = function () { n.photoBroken = true; };
+      img.src = n.photoUrl;
     });
   }
+  function putPhoto(n, src) {
+    if (!src || S.view !== 'nominee' || current().id !== n.id) return;
+    var slot = document.getElementById('photo');
+    if (!slot) return;
+    var img = el('img', { cls: 'photo', id: 'photo', alt: 'Photograph of ' + n.name });
+    img.onerror = function () {
+      if (src !== n.photoUrl) return;
+      n.photoBroken = true;
+      img.replaceWith(el('div', { cls: 'photo', id: 'photo', text: initials(n.name), role: 'img', 'aria-label': n.name }));
+      photoFromScript(n).then(function (data) { putPhoto(n, data); });
+    };
+    img.src = src;
+    slot.replaceWith(img);
+  }
+  function showPhoto(n) {
+    if (n.photoUrl && !n.photoBroken) { putPhoto(n, n.photoUrl); return; }
+    photoFromScript(n).then(function (data) { putPhoto(n, data); });
+  }
+  function loadPhoto(n) { return photoFromScript(n); }
 
   function recusePrompt() {
     var n = current();
@@ -619,8 +656,9 @@ h1,h2,p,dl,dd{margin:0}
         el('span', { text: 'Tap any name to change a rating.' }),
         el('span', { text: 'You cannot change ratings after submitting.' })),
       crowded ? el('p', { cls: 'notice', text: counts[crowded] + ' nominees share a score of ' + fmt(crowded) + '. Separate them if you can, because awards are limited.' }) : null,
-      el('p', { cls: 'notice', id: 'submit-note', hidden: 'hidden',
-        text: 'Your ratings did not reach us. Check your internet connection and tap Submit my ratings again. Ratings already saved are kept.' }),
+      el('div', { cls: 'notice', id: 'submit-note', hidden: 'hidden' },
+        el('p', { id: 'submit-text' }),
+        el('p', { cls: 'code', id: 'submit-code' })),
       el('div', { cls: 'rows' }, items.map(function (x) { return nomineeRow(x.n, x.i, openNominee); }))
     ];
     var dock = el('footer', { cls: 'dock' }, el('button', {
@@ -634,20 +672,44 @@ h1,h2,p,dl,dd{margin:0}
     paintSave(Object.keys(S.q).length ? 'saving' : '');
   }
 
+  /* One request carries every rating and the submission. A slow reply is retried automatically. */
   function submit() {
     var button = document.getElementById('submit');
-    if (button) { button.disabled = true; button.textContent = 'Submitting'; }
     var note = document.getElementById('submit-note');
-    if (note) note.hidden = true;
-    drain().then(function () { return call('submitBallot', CODE); }).then(function (res) {
-      if (res && res.ok) { message('Thank you, ' + S.d.memberName, 'Your ratings have been submitted.'); return; }
-      if (res && res.ok === false && res.reason === 'incomplete') { load('review'); return; }
+    var noteText = document.getElementById('submit-text');
+    var codeLine = document.getElementById('submit-code');
+    var say = function (text) {
+      if (!note) return;
+      note.hidden = !text;
+      if (noteText) noteText.textContent = text || '';
+      if (codeLine) codeLine.textContent = '';
+    };
+    if (button) { button.disabled = true; button.textContent = 'Submitting'; }
+    say('');
+    S.submitting = true;
+    clearTimeout(S.timer);
+    var list = nominees().map(function (n) {
+      var v = S.v[n.id] || {};
+      return { id: n.id, score: v.score || null, recused: !!v.recused };
+    });
+    var TRIES = 6;
+    callRetry('submitBallot', [CODE, list], TRIES, function (attempt) {
+      say('Google is answering slowly. Still trying, attempt ' + attempt + ' of ' + TRIES + '. Please wait.');
+    }).then(function (res) {
+      S.submitting = false;
+      if (res && res.ok) {
+        S.q = {};
+        backup();
+        message('Thank you, ' + S.d.memberName, 'Your ratings have been submitted.');
+        return;
+      }
+      if (res && res.reason === 'incomplete') { load('review'); return; }
       load();
-    }).catch(function () {
+    }).catch(function (err) {
+      S.submitting = false;
       if (button) { button.disabled = false; button.textContent = 'Submit my ratings'; }
-      paintSave('failed');
-      var notice = document.getElementById('submit-note');
-      if (notice) notice.hidden = false;
+      say('We could not reach the server just now. Your ratings are kept on this phone, even if you close this page. Please tap Submit my ratings again in a few minutes.');
+      if (codeLine) codeLine.textContent = 'Reference for the coordinator: ' + ((err && err.message) || 'unknown');
     });
   }
 
@@ -659,20 +721,29 @@ h1,h2,p,dl,dd{margin:0}
   }
 
   function load(next) {
+    if (typeof next !== 'string') next = null;
     message('Loading nominees', 'This can take a few seconds.');
-    call('getBallot', CODE).then(function (d) {
+    callRetry('getBallot', [CODE], 4, function () {
+      message('Still loading', 'Google is answering slowly. Please wait a little longer.');
+    }).then(function (d) {
       S.d = d;
       if (d.state === 'invalid') return message('This link is not valid', 'Ask the award coordinator for your personal voting link.');
       if (d.state === 'notopen') return message('Voting has not opened yet', 'Please use this same link once voting opens.');
       if (d.state === 'closed') return message('Voting has closed', 'Voting closed on ' + d.closes + '.');
-      if (d.state === 'submitted') return message('Thank you, ' + d.memberName, 'Your ratings have been submitted.');
+      if (d.state === 'submitted') {
+        S.q = {};
+        backup();
+        return message('Thank you, ' + d.memberName, 'Your ratings have been submitted.');
+      }
       if (!d.nominees.length) return message('No nominees yet', 'Please check back once the list is ready.');
       S.v = d.votes || {};
       S.q = {};
+      restore();
       if (next === 'review') review(); else home();
       prefetchPhotos();
+      if (Object.keys(S.q).length) S.timer = setTimeout(pump, 1500);
     }).catch(function () {
-      message('The nominees did not load', 'Check your connection and try again.', true);
+      message('The nominees did not load', 'Google is not answering right now. Please try again in a minute.', true);
     });
   }
 
