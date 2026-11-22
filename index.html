@@ -183,18 +183,32 @@ h1,h2,p,dl,dd{margin:0}
     });
   }
 
-  /* Tries up to `tries` times. onRetry(attempt) lets the screen say it is still trying. */
-  function callRetry(name, args, tries, onRetry) {
-    var attempt = 1;
+  /* Google's script server leaves some requests unanswered for 15 seconds or more, while answering an
+     identical request sent a moment later in 2 to 3 seconds. So if no answer comes within 3 seconds, the
+     same request is sent again without cancelling the first, and the first answer to arrive is used.
+     Every request is safe to repeat. */
+  var HEDGE_AFTER = 3000;
+  function callRetry(name, args, tries) {
     return new Promise(function (resolve, reject) {
-      (function go() {
-        call(name, args).then(resolve, function (err) {
-          if (attempt >= tries) return reject(err);
-          attempt++;
-          if (onRetry) onRetry(attempt);
-          setTimeout(go, 1500);
+      var started = 0, failed = 0, finished = false, timer = null, lastErr = null;
+      var launch = function () {
+        if (finished) return;
+        started++;
+        call(name, args, 30000).then(function (value) {
+          if (finished) return;
+          finished = true;
+          clearTimeout(timer);
+          resolve(value);
+        }, function (err) {
+          if (finished) return;
+          failed++;
+          lastErr = err;
+          if (failed >= tries) { finished = true; clearTimeout(timer); reject(lastErr); return; }
+          if (started < tries) { clearTimeout(timer); timer = setTimeout(launch, 1000); }
         });
-      })();
+        if (started < tries) timer = setTimeout(launch, HEDGE_AFTER);
+      };
+      launch();
     });
   }
 
@@ -555,27 +569,38 @@ h1,h2,p,dl,dd{margin:0}
     shell(kids, dock);
     paintRating();
     showPhoto(n);
-    var nextOne = nominees()[index + 1];
-    if (nextOne && !nextOne.photoUrl) loadPhoto(nextOne);
     var heading = document.getElementById('name');
     if (heading) heading.focus({ preventScroll: true });
     paintSave(Object.keys(S.q).length ? 'saving' : '');
   }
 
-  /* Photos come straight from Google Drive when the files can be viewed by link; otherwise from the
-     script, one at a time, so photo requests never crowd out ratings. */
+  /* Photos come straight from Google Drive when this phone can open the files. Otherwise all photos are
+     fetched from the script in one request, so photo requests never crowd out ratings. */
+  var allPhotos = null;
   function photoFromScript(n) {
     if (!n.hasPhoto) return Promise.resolve(null);
-    if (S.photos[n.id] === undefined) {
-      S.photos[n.id] = call('getPhoto', [CODE, n.id], 20000).catch(function () { delete S.photos[n.id]; return null; });
+    if (!allPhotos) {
+      allPhotos = callRetry('getPhotos', [CODE], 3).then(function (map) { return map || {}; }, function (err) {
+        allPhotos = null;
+        if (err && err.server) {
+          /* Older server without group photos: one at a time. */
+          return call('getPhoto', [CODE, n.id], 20000).then(function (d) { var m = {}; m[n.id] = d; return m; }, function () { return {}; });
+        }
+        return {};
+      });
     }
-    return S.photos[n.id];
+    return allPhotos.then(function (map) { return (map && map[n.id]) || null; });
   }
   function prefetchPhotos() {
-    nominees().forEach(function (n) {
-      if (!n.photoUrl) return;
+    var useScript = function () {
+      var first = nominees().filter(function (n) { return n.hasPhoto; })[0];
+      if (first) photoFromScript(first);
+    };
+    var direct = nominees().filter(function (n) { return n.photoUrl; });
+    if (!direct.length) { useScript(); return; }
+    direct.forEach(function (n) {
       var img = new Image();
-      img.onerror = function () { n.photoBroken = true; };
+      img.onerror = function () { n.photoBroken = true; useScript(); };
       img.src = n.photoUrl;
     });
   }
@@ -597,7 +622,6 @@ h1,h2,p,dl,dd{margin:0}
     if (n.photoUrl && !n.photoBroken) { putPhoto(n, n.photoUrl); return; }
     photoFromScript(n).then(function (data) { putPhoto(n, data); });
   }
-  function loadPhoto(n) { return photoFromScript(n); }
 
   function recusePrompt() {
     var n = current();
@@ -692,10 +716,9 @@ h1,h2,p,dl,dd{margin:0}
       var v = S.v[n.id] || {};
       return { id: n.id, score: v.score || null, recused: !!v.recused };
     });
-    var TRIES = 6;
-    callRetry('submitBallot', [CODE, list], TRIES, function (attempt) {
-      say('Google is answering slowly. Still trying, attempt ' + attempt + ' of ' + TRIES + '. Please wait.');
-    }).then(function (res) {
+    var slowNote = setTimeout(function () { say('Google is answering slowly. Please wait, still trying.'); }, 6000);
+    callRetry('submitBallot', [CODE, list], 8).then(function (res) {
+      clearTimeout(slowNote);
       S.submitting = false;
       if (res && res.ok) {
         S.q = {};
@@ -706,6 +729,7 @@ h1,h2,p,dl,dd{margin:0}
       if (res && res.reason === 'incomplete') { load('review'); return; }
       load();
     }).catch(function (err) {
+      clearTimeout(slowNote);
       S.submitting = false;
       if (button) { button.disabled = false; button.textContent = 'Submit my ratings'; }
       say('We could not reach the server just now. Your ratings are kept on this phone, even if you close this page. Please tap Submit my ratings again in a few minutes.');
@@ -723,9 +747,11 @@ h1,h2,p,dl,dd{margin:0}
   function load(next) {
     if (typeof next !== 'string') next = null;
     message('Loading nominees', 'This can take a few seconds.');
-    callRetry('getBallot', [CODE], 4, function () {
+    var slowNote = setTimeout(function () {
       message('Still loading', 'Google is answering slowly. Please wait a little longer.');
-    }).then(function (d) {
+    }, 7000);
+    callRetry('getBallot', [CODE], 6).then(function (d) {
+      clearTimeout(slowNote);
       S.d = d;
       if (d.state === 'invalid') return message('This link is not valid', 'Ask the award coordinator for your personal voting link.');
       if (d.state === 'notopen') return message('Voting has not opened yet', 'Please use this same link once voting opens.');
@@ -743,6 +769,7 @@ h1,h2,p,dl,dd{margin:0}
       prefetchPhotos();
       if (Object.keys(S.q).length) S.timer = setTimeout(pump, 1500);
     }).catch(function () {
+      clearTimeout(slowNote);
       message('The nominees did not load', 'Google is not answering right now. Please try again in a minute.', true);
     });
   }
